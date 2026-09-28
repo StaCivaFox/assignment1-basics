@@ -1,6 +1,6 @@
+import regex as re
 import os
 from typing import BinaryIO
-from cs336_basics import pretokenization
 
 
 def find_chunk_boundaries(
@@ -49,12 +49,36 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+def pretokenization_step(
+        text: str,
+        split_special_tokens: list[str],
+        counts: dict[tuple[bytes, ...], int]
+) -> None:
+    # Remove special token
+    if not split_special_tokens:
+        doc_list = [text]
+    else:
+        ordered = sorted(split_special_tokens, key=len, reverse=True)
+        split_pattern = "|".join(list(map(re.escape, ordered)))
+        doc_list = re.split(split_pattern, text)
+    # Iterate through docs and find match
+    matched_str_dict = {}
+    for doc in doc_list:
+        for match in re.finditer(PAT, doc):
+            matched_str = match.group(0).encode("utf-8")
+            if matched_str not in matched_str_dict:
+                matched_str_dict[matched_str] = tuple(bytes([value]) for value in matched_str)
+            key = matched_str_dict[matched_str]
+            counts[key] = counts[key] + 1 if key in counts else 1
 
-if __name__ == "__main__":
-    ## Usage
-    with open("/home/fox/assignment1-basics/notes.txt", "rb") as f:
-        num_processes = 4
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+def pretokenization(
+        path: str,
+        special_split_tokens: list[str]
+) -> dict[tuple[bytes, ...], int]:
+    with open(path, "rb") as f:
+        num_processes = 8
+        boundaries = find_chunk_boundaries(f, num_processes, special_split_tokens[0].encode("utf-8"))
         counts = {}
         # The following is a serial implementation, but you can parallelize this
         # by sending each start/end pair to a set of processes.
@@ -62,5 +86,10 @@ if __name__ == "__main__":
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
             # Run pre-tokenization on your chunk and store the counts for each pre-token
-            pretokenization.pretokenization(chunk, "<|endoftext|>", counts)
-        print(counts)
+            pretokenization_step(chunk, special_split_tokens, counts)
+    return counts
+
+if __name__ == "__main__":
+    counts = pretokenization("/home/fox/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt", "<|endoftext|>")
+    # print(counts)    
+
