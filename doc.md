@@ -12,3 +12,7 @@
   that tuple key in the pre-token dict.4.iterate through pre-token
   dict for yet another pass and create a new dict[tuple[bytes, bytes],
   int],and repeat step 2-4
+
+  p | a | b | p len = 4
+  p | a | b len = 3
+  p | ab | p | a | q | r
