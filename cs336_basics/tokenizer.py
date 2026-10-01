@@ -1,107 +1,158 @@
-from cs336_basics import pretokenization as prt
+import pickle
+from collections.abc import Iterable, Iterator
+from cs336_basics import train_bpe, pretokenization
 
-def train_bpe (
-        input_path: str,
-        vocab_size: int,
-        special_tokens: list[str]
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # Initialize vocabulary
-    vocab = {}
-    for i in range(256):
-        vocab[i] = bytes([i])
-    for index, sp_token in enumerate(special_tokens):
-        vocab[256 + index] = sp_token.encode("utf-8")
-        
-    # Pretokenize
-    counts = prt.pretokenization(input_path, special_tokens)
-    
-    # Create byte-pair mapping and pair-pretoken mapping
-    byte_pair_map = {}
-    pair_to_pretokens = {}
-    pretoken_to_key = {}
-    for key, value in counts.items():
-        pretoken_str = b"".join(key).decode("utf-8")
-        if pretoken_str not in pretoken_to_key:
-            pretoken_to_key[pretoken_str] = key
-        for l, r in zip(key, key[1:]):
-            byte_pair_map[(l, r)] = byte_pair_map[(l, r)] + value if (l, r) in byte_pair_map else value
-            if (l, r) in pair_to_pretokens:
-                pair_to_pretokens[(l, r)].add(pretoken_str)
-            else:
-                pair_to_pretokens[(l, r)] = {pretoken_str}
-    # print(pretoken_to_key)
-    # print(pair_to_pretokens)
-    # Iteratively merge
-    
-    merges = []
-    
-    while len(vocab) < vocab_size:
-        # Find the most frequent pair in byte_pair_map
-        best_pair = max(byte_pair_map, key=lambda pair: (byte_pair_map.get(pair), pair))
-        # Record merging for test
-        merges.append(best_pair)
-        # Add the merged pair to vocab
-        new_id = len(vocab)
-        vocab[new_id] = best_pair[0] + best_pair[1]
-        # We don't have to traverse through the whole 'counts' dict
-        # Instead, traverse only the affected pretokens indicated by pair_to_pretokens
-        affected_pretokens = pair_to_pretokens[best_pair].copy()
-        for str in affected_pretokens:
-            key_in_counts = pretoken_to_key[str]
-            appear_counts = counts[key_in_counts]
-            new_key = []
-            i = 0
-            while i < len(key_in_counts):
-                pair = key_in_counts[i:i + 2]
-                if pair == best_pair:
-                    new_pair = pair[0] + pair[1]
-                    new_key.append(new_pair)
-                    i += 1
-                else:
-                    new_key.append(pair[0])
-                i += 1
-            new_key_tuple = tuple(new_key)
-            pretoken_to_key[str] = new_key_tuple
-            # Update byte_pair_map and pair_to_pretokens 
-            # by comparing pair counts before and after merge in this specific affected pretoken
-            old_pair_count = {}
-            new_pair_count = {}
-            for l, r in zip(key_in_counts, key_in_counts[1:]):
-                old_pair_count[(l, r)] = old_pair_count[(l, r)] + 1 if (l, r) in old_pair_count else 1
-            for l, r in zip(new_key_tuple, new_key_tuple[1:]):
-                new_pair_count[(l, r)] = new_pair_count[(l, r)] + 1 if (l, r) in new_pair_count else 1
-            all_pairs = old_pair_count.keys() | new_pair_count.keys()
-            for pair in all_pairs:
-                if new_pair_count.get(pair, 0) == 0:
-                    pair_to_pretokens[pair].discard(str)
-                if pair in new_pair_count and pair not in old_pair_count:
-                    if pair in pair_to_pretokens:
-                        pair_to_pretokens[pair].add(str)
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+        self.merged_pair_to_pos = {}
+        for index, pair in enumerate(self.merges):
+            self.merged_pair_to_pos[pair] = index
+        # Add unseen special tokens to vocab
+        vocab_size = len(vocab)
+        if special_tokens:
+            offset = 0
+            for str in special_tokens:
+                str_encoded = str.encode("utf-8")
+                if str_encoded not in self.vocab.values():
+                    self.vocab[vocab_size + offset] = str_encoded
+                    offset += 1
+        # print(self.vocab)
+
+
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        # The provided tests don't call this method;
+        # Therefore, assume vocab and merges is saved as pickle.dump file in terms of convenience
+        with open(vocab_filepath, "rb") as f:
+            vocab: dict[int, bytes] = pickle.load(f)
+        with open(merges_filepath, "rb") as f:
+            merges: list[tuple[bytes, bytes]] = pickle.load(f)
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        # Pre-tokenize
+        pretokens_list = pretokenization.pretokenization_for_tokenizer(text, self.special_tokens)
+        # print(pretokens_list)
+        encoded_text = []
+        vocab_to_id = {value: key for key, value in self.vocab.items()}
+        pretoken_to_id = {} #dict[tuple[bytes, ...], list[int]], the key being the original not-merged tuple
+        # Iterate through each pre-token and encode it
+        for pretoken in pretokens_list:
+            if pretoken in pretoken_to_id:
+                token_id = pretoken_to_id[pretoken]
+                encoded_text.extend(token_id)
+                continue
+            token_id = []
+            tmp_pretoken = pretoken
+            # Iteratively merge each pretoken's inner bytes
+            while True:
+                merged_pretoken = []
+                # Choose the earliest-appearing pair to merge
+                best_pair = None
+                for l, r in zip(tmp_pretoken, tmp_pretoken[1:]):
+                    # print(l, r)
+                    if (l, r) in self.merged_pair_to_pos and \
+                    (best_pair is None or \
+                     self.merged_pair_to_pos[(l, r)] < self.merged_pair_to_pos[best_pair]):
+                        best_pair = (l, r)
+                if best_pair is None:
+                    break
+                i = 0
+                # Merge for one round
+                while i < len(tmp_pretoken):
+                    pair = tmp_pretoken[i:i + 2]
+                    if pair == best_pair:
+                        new_pair = pair[0] + pair[1]
+                        merged_pretoken.append(new_pair)
+                        i += 1
                     else:
-                        pair_to_pretokens[pair] = {str}
-                change = new_pair_count.get(pair, 0) - old_pair_count.get(pair, 0)
-                byte_pair_map[pair] = byte_pair_map[pair] + change * appear_counts if pair in byte_pair_map else change * appear_counts
-            
-            # Update 'counts'
-            del counts[key_in_counts]
-            counts[new_key_tuple] = appear_counts
-        # Update byte_pair_map, deleting all zero-value entries
-        byte_pair_map = {
-            pair: count
-            for pair, count in byte_pair_map.items()
-            if count != 0
-        }
-        # Update pair_to_pretokens, deleting all empty sets
-        pair_to_pretokens = {
-            pair: pretokens
-            for pair, pretokens in pair_to_pretokens.items()
-            if pretokens
-        }
-    return vocab, merges
-            
+                        merged_pretoken.append(pair[0])
+                    i += 1
+                tmp_pretoken = tuple(merged_pretoken)
+            # When leaving the loop, tmp_pretoken is a tuple holding bytes indexed into vocab
+            for token in tmp_pretoken:
+                token_id.append(vocab_to_id[token])
+            pretoken_to_id[pretoken] = token_id
+            encoded_text.extend(token_id)
+        return encoded_text
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for str in iterable:
+            encoding = self.encode(str)
+            yield from encoding
+
+    def decode(self, ids: list[int]) -> str:
+        byte_parts = map(lambda token_id: self.vocab[token_id], ids)
+        result_str = b"".join(byte_parts).decode("utf-8", errors="replace")
+        return result_str
+
+                
 
 
-# if __name__ == "__main__":
-#     vocab, merges = train_bpe("/home/fox/assignment1-basics/notes.txt", 263, ["<|endoftext|>"])
-#     print(vocab)
-#     print(merges)
+
+
+
+if __name__ == "__main__":
+    def test_handout_encoding():
+        vocab = {
+            0: b" ",
+            1: b"a",
+            2: b"c",
+            3: b"e",
+            4: b"h",
+            5: b"t",
+            6: b"th",
+            7: b" c",
+            8: b" a",
+            9: b"the",
+            10: b" at",
+        }
+
+        merges = [
+            (b"t", b"h"),
+            (b" ", b"c"),
+            (b" ", b"a"),
+            (b"th", b"e"),
+            (b" a", b"t"),
+        ]
+
+        tokenizer = Tokenizer(vocab, merges)
+
+        # Check individual pretokens, preserving leading spaces.
+        assert tokenizer.encode("the") == [9]
+        assert tokenizer.encode(" cat") == [7, 1, 5]
+        assert tokenizer.encode(" ate") == [10, 3]
+
+        # Check the complete input.
+        assert tokenizer.encode("the cat ate") == [9, 7, 1, 5, 10, 3]
+        print(tokenizer.encode("the cat ate"))
+
+    def test_priority_encoding():
+            vocab = {
+                0: b" ",
+                1: b"a",
+                2: b"b",
+                3: b"c",
+                4: b"ab",
+                5: b"abc",
+            }
+    
+            merges = [
+                (b"a", b"b"),
+                (b"ab", b"c"),
+            ]
+    
+            tokenizer = Tokenizer(vocab, merges)
+    
+    
+            print(tokenizer.encode("abc"))
+
+    # test_handout_encoding()
+    test_priority_encoding()
+    # vocab, merges = train_bpe.train_bpe("/home/fox/assignment1-basics/notes.txt", 263, ["<|endoftext|>"])
+    # tokenizer = Tokenizer(vocab, merges, ["<|endoftext|>", "<PAD>"])
+    # tokenizer.encode("low low low low low lower lower widest widest widest newest newest newest newest newest newest")
+

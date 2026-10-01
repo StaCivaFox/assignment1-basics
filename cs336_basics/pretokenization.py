@@ -77,7 +77,7 @@ def pretokenization(
         special_split_tokens: list[str]
 ) -> dict[tuple[bytes, ...], int]:
     with open(path, "rb") as f:
-        num_processes = 8
+        num_processes = 32
         boundaries = find_chunk_boundaries(f, num_processes, special_split_tokens[0].encode("utf-8"))
         counts = {}
         # The following is a serial implementation, but you can parallelize this
@@ -89,7 +89,33 @@ def pretokenization(
             pretokenization_step(chunk, special_split_tokens, counts)
     return counts
 
-if __name__ == "__main__":
-    counts = pretokenization("/home/fox/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt", "<|endoftext|>")
+def pretokenization_for_tokenizer(
+        text: str,
+        special_split_tokens: list[str]
+) -> list[tuple[bytes, ...]]:
+    # Remove special token
+    if not special_split_tokens:
+        doc_list = [text]
+    else:
+        ordered = sorted(special_split_tokens, key=len, reverse=True)
+        # Special attention: put capturing group around pattern to preseve splitting tokens in the result
+        split_pattern = "(" + "|".join(list(map(re.escape, ordered))) + ")"
+        doc_list = re.split(split_pattern, text)
+    # Iterate through docs and find match
+    pretokens_list = []
+    matched_str_dict = {}
+    for doc in doc_list:
+        if special_split_tokens and doc in special_split_tokens:
+            special_bytes = doc.encode("utf-8")
+            pretokens_list.append((special_bytes,))
+            continue
+        for match in re.finditer(PAT, doc):
+            matched_str = match.group(0).encode("utf-8")
+            if matched_str not in matched_str_dict:
+                matched_str_dict[matched_str] = tuple(bytes([value]) for value in matched_str)
+            pretokens_list.append(matched_str_dict[matched_str])
+    return pretokens_list
+# if __name__ == "__main__":
+#     counts = pretokenization("/home/fox/assignment1-basics/data/TinyStories-train-100MB.txt", "<|endoftext|>")
     # print(counts)    
 
