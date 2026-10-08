@@ -5,6 +5,8 @@ __pycache__/
 
 # dataset
 data/
+# runs
+runs/
 
 # C extensions
 *.so
