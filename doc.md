@@ -16,3 +16,12 @@
   p | a | b | p len = 4
   p | a | b len = 3
   p | ab | p | a | q | r
+
+  # generate
+  while not reach max token or not reach eos:
+    1.make one inference pass through model, producing logits shaped (batch_size, seq_len, vocab_size)
+    2.pass logits through a temperature-controlled softmax, producing probabilities shaped (batch_size, seq_len, vocab_size)
+    3.get the predicted probabilities distribution of the (seq_len - 1)th token of each batch, getting q shaped (batch_size, vocab_size) where vocab_size describes a next-token distribution for each batch
+    4. use top-p to truncate and renormalize the last axis of q(batch_size, vocab_size), getting a probability distribution for sampling
+    5.sample using torch.multinomial, getting (batch_size, 1), with one next token id for each batch
+    6.concatenate the newly predicted token id to x and slice the last seq_len entries, prepare for next pass

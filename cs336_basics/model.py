@@ -163,6 +163,7 @@ class TransformerLM(nn.Module):
             rope_theta: float | None = 10000.0
         ):
         super().__init__()
+        self.context_length = context_length
         self.embedding = Embedding(vocab_size, d_model)
         self.positional_encoder = RotaryPositionalEmbedding(rope_theta, d_model // num_heads, context_length)
         self.transformer_blocks = nn.ModuleList([
@@ -178,4 +179,63 @@ class TransformerLM(nn.Module):
         x = self.output_embedding(self.norm(x))
         return x
 
+    @torch.no_grad()
+    def generate(
+        self,
+        x: torch.Tensor,
+        max_token_num: int,
+        temperature: float = 1.0,
+        top_p: float | None = None,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Return a batch of prompts with at most max_token_num new tokens appended.
+
+        Temperature must be positive; top_p=None samples from the full vocabulary.
+        Finished sequences are padded with EOS while other batch items continue.
+        """
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if top_p is not None and not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if max_token_num < 0:
+            raise ValueError("max_token_num must be nonnegative")
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if x.dim() != 2 or x.shape[-1] == 0:
+            raise ValueError("x must be a nonempty token sequence or a batch of token sequences")
+        batch_size = x.shape[0]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+
+        for _ in range(max_token_num):
+            # make one inference pass through model
+            logits = self.forward(x[:, -self.context_length:])
+            # Get the last token logit
+            logits = logits[:, -1, :] # (batch_size, vocab_size)
+            # Pass temperature controlled softmax
+            probs = softmax(logits / temperature, dim=-1)
+            if top_p is not None and top_p < 1:
+                sorted_probs, original_pos = torch.sort(probs, dim=-1, descending=True)
+                sorted_probs_cumsum = torch.cumsum(sorted_probs, dim=-1)
+                # Create boolean mask for top-p cutoff
+                mask = sorted_probs_cumsum >= top_p # (batch_size, vocab_size)
+                # Flip the mask for the crossing token
+                flip_index = torch.argmax(mask.int(), dim=-1) #(batch_size)
+                mask[torch.arange(end=batch_size, device=x.device), flip_index] = False
+                # Apply mask to cut off
+                cut_sorted_probs = torch.masked_fill(sorted_probs, mask, 0.0)
+                # Sample the next token id (multinomial normalizes the remaining weights)
+                sorted_index = torch.multinomial(cut_sorted_probs, 1) # (batch_size, 1)
+                next_token_ids = torch.gather(original_pos, dim=-1, index=sorted_index) #(batch_size, 1)
+            else:
+                next_token_ids = torch.multinomial(probs, 1) #(batch_size, 1)
+            # Keep completed sequences at EOS while the rest of the batch continues
+            if eos_token_id is not None:
+                next_token_ids = next_token_ids.masked_fill(finished.unsqueeze(-1), eos_token_id)
+                finished |= next_token_ids.squeeze(-1) == eos_token_id
+            x = torch.cat((x, next_token_ids), dim=-1)
+            # End generation once every sequence has generated an EOS token
+            if eos_token_id is not None and finished.all():
+                break
+
+        return x
 

@@ -1,4 +1,4 @@
-"""CLI and setup for Section 5; the student implements train().
+"""Train a language model and track Section 7 experiments.
 
 Run ``uv run python -m cs336_basics.train --help`` for all options.
 Use --dry-run to check data and initialization without taking training steps.
@@ -11,7 +11,9 @@ import json
 import logging
 import math
 import random
-from datetime import datetime
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -61,10 +63,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     training.add_argument("--seed", type=int, default=42)
 
     reporting = parser.add_argument_group("reporting")
+    reporting.add_argument("--experiment-name", help="Name for this experiment, saved in config.json and W&B")
+    reporting.add_argument("--notes", default="", help="What you are testing or changing in this experiment")
     reporting.add_argument("--log-every", type=int, default=10)
     reporting.add_argument("--eval-every", type=int, default=100)
     reporting.add_argument("--eval-batches", type=int, default=10)
     reporting.add_argument("--checkpoint-every", type=int, default=100)
+    reporting.add_argument("--wandb-project", help="Enable optional Weights & Biases logging to this project")
+    reporting.add_argument("--wandb-mode", choices=("online", "offline"), default="online")
     reporting.add_argument("--dry-run", action="store_true", help="Check setup and exit before calling train()")
 
     args = parser.parse_args(argv)
@@ -139,14 +145,92 @@ def setup_logging(run_dir: Path) -> logging.Logger:
     return logger
 
 
-def log_metrics(logger: logging.Logger, run_dir: Path, iteration: int, **metrics: float) -> None:
-    """Record scalar metrics supplied by your loop in the console, log file, and JSONL file."""
+def setup_wandb(args: argparse.Namespace, config: dict):
+    """Define separate loss curves against completed updates and elapsed seconds."""
+    if args.wandb_project is None:
+        return None
+    import wandb
+
+    run = wandb.init(
+        project=args.wandb_project,
+        name=args.experiment_name or args.run_dir.name,
+        notes=args.notes,
+        config=config,
+        dir=str(args.run_dir),
+        mode=args.wandb_mode,
+    )
+    run.define_metric("iteration")
+    run.define_metric("elapsed_seconds")
+    run.define_metric("step/*", step_metric="iteration")
+    run.define_metric("time/*", step_metric="elapsed_seconds")
+    return run
+
+
+def log_metrics(
+    logger: logging.Logger,
+    run_dir: Path,
+    iteration: int,
+    *,
+    elapsed_seconds: float,
+    wandb_run=None,
+    **metrics: float,
+) -> None:
+    """Write one record with both x axes; retain nonfinite losses as explicit divergence evidence."""
     values = {name: float(value) for name, value in metrics.items()}
-    record = {"iteration": iteration, **values}
+    record = {
+        "iteration": iteration,
+        "elapsed_seconds": elapsed_seconds,
+        "timestamp": datetime.now(UTC).isoformat(),
+        **{name: value if math.isfinite(value) else None for name, value in values.items()},
+    }
+    nonfinite = [name for name, value in values.items() if not math.isfinite(value)]
+    if nonfinite:
+        record["nonfinite_metrics"] = nonfinite
+        logger.warning("Nonfinite metrics at iteration %d: %s", iteration, ", ".join(nonfinite))
     line = json.dumps(record, allow_nan=False)
     with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(line + "\n")
-    logger.info("iteration=%d %s", iteration, " ".join(f"{name}={value:.6g}" for name, value in values.items()))
+    logger.info(
+        "iteration=%d elapsed_seconds=%.3f %s",
+        iteration,
+        elapsed_seconds,
+        " ".join(f"{name}={value:.6g}" for name, value in values.items()),
+    )
+    if wandb_run is not None:
+        wandb_values = {"iteration": iteration, "elapsed_seconds": elapsed_seconds}
+        for name, value in values.items():
+            if math.isfinite(value):
+                wandb_values[f"step/{name}"] = value
+                wandb_values[f"time/{name}"] = value
+        wandb_values["nonfinite_metric_count"] = len(nonfinite)
+        wandb_run.log(wandb_values)
+
+
+def restore_elapsed_seconds(checkpoint: Path, iteration: int, logger: logging.Logger) -> float:
+    """Recover time at this checkpoint, even when resuming into a new run directory."""
+    metrics_path = checkpoint.parent / "metrics.jsonl"
+    elapsed_seconds = None
+    if metrics_path.exists():
+        with metrics_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # A process interruption can leave an incomplete final line.
+                if record.get("iteration") == iteration and "elapsed_seconds" in record:
+                    elapsed_seconds = record["elapsed_seconds"]
+    if elapsed_seconds is None:
+        logger.warning("No timing record for checkpoint %s; elapsed time starts at this session", checkpoint)
+        return 0.0
+    return float(elapsed_seconds)
+
+
+def synchronize_device(device: torch.device) -> None:
+    """Wait for accelerator work before reading the wall-clock timer."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def load_token_array(path: Path, token_dtype: str | None, context_length: int, vocab_size: int) -> np.ndarray:
@@ -175,17 +259,21 @@ def train(
     val_tokens: np.ndarray,
     start_iteration: int,
     logger: logging.Logger,
+    start_elapsed_seconds: float = 0.0,
+    wandb_run=None,
+    checkpoint_callback: Callable[[], None] | None = None,
 ) -> None:
-    """Student work: training updates, validation, and checkpoint/reporting cadence.
-
-    Everything above and main() below is scaffolding. Implement the Section 5
-    loop here, using your existing components in data.py, nn_utils.py, and
-    optimizer.py. log_metrics() is available for scalar reporting.
+    """Run training updates, validation, checkpointing, and experiment logging.
 
     start_iteration counts completed updates. args.steps is the total target,
     including updates already completed before a checkpoint was saved.
+    Elapsed time includes validation, logging, and checkpointing within the loop;
+    it excludes initialization and downtime between resumed sessions.
     """
-    # TODO: Implement your training loop here.
+    device = torch.device(args.device)
+    synchronize_device(device)
+    start_time = time.perf_counter()
+    model.train()
     for i in range(start_iteration, args.steps):
         # Get the learning rate for this iteration
         lr = optim.get_lr_cosine(i, args.max_lr, args.min_lr, args.warmup_steps, args.anneal_steps)
@@ -206,8 +294,12 @@ def train(
             group["lr"] = lr
         optimizer.step()
         completed_run = i + 1
+        final_step = completed_run == args.steps
+        should_eval = completed_run % args.eval_every == 0 or final_step
+        should_checkpoint = completed_run % args.checkpoint_every == 0 or final_step
+        metrics = {}
         # Run validation
-        if completed_run % args.eval_every == 0:
+        if should_eval:
             with torch.no_grad():
                 eval_loss = torch.tensor(0.0, device=args.device)
                 model.eval()
@@ -218,19 +310,26 @@ def train(
                     eval_loss += loss_eval
                 eval_loss /= args.eval_batches
                 model.train()
-            log_metrics(logger, args.run_dir, completed_run, train_loss=loss.item(), val_loss=eval_loss.item(), lr=lr)
-        # Logging
-        if completed_run % args.log_every == 0:
-            log_metrics(logger, args.run_dir, completed_run, train_loss=loss.item(), lr=lr)
-        if completed_run % args.checkpoint_every == 0:
+            metrics["val_loss"] = eval_loss.item()
+        if should_checkpoint:
             data.save_checkpoint(model, optimizer, completed_run, args.run_dir / f"checkpoint{completed_run}")
-    data.save_checkpoint(model, optimizer, args.steps, args.run_dir / f"checkpoint{args.steps}")
+        # Merge coinciding events into one record and always record checkpoint times.
+        if i == start_iteration or completed_run % args.log_every == 0 or should_eval or should_checkpoint:
+            metrics.update(train_loss=loss.item(), lr=lr)
+            synchronize_device(device)
+            log_metrics(
+                logger,
+                args.run_dir,
+                completed_run,
+                elapsed_seconds=start_elapsed_seconds + time.perf_counter() - start_time,
+                wandb_run=wandb_run,
+                **metrics,
+            )
+        if should_checkpoint and checkpoint_callback is not None:
+            checkpoint_callback()
 
 
-    
-
-
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None, *, checkpoint_callback: Callable[[], None] | None = None) -> None:
     args = parse_args(argv)
     logger = setup_logging(args.run_dir)
     config = {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()}
@@ -272,11 +371,13 @@ def main(argv: list[str] | None = None) -> None:
         weight_decay=args.weight_decay,
     )
     start_iteration = 0
+    start_elapsed_seconds = 0.0
     if args.resume is not None:
         start_iteration = data.load_checkpoint(args.resume, model, optimizer)
         if not isinstance(start_iteration, int) or not 0 <= start_iteration <= args.steps:
             raise ValueError("Checkpoint iteration must be an integer between zero and --steps")
         logger.info("Restored checkpoint %s at %d completed updates", args.resume, start_iteration)
+        start_elapsed_seconds = restore_elapsed_seconds(args.resume, start_iteration, logger)
     logger.info(
         "Model parameters=%d; device=%s; completed updates=%d; target updates=%d",
         sum(p.numel() for p in model.parameters()),
@@ -287,7 +388,20 @@ def main(argv: list[str] | None = None) -> None:
     if args.dry_run:
         logger.info("Dry run complete. Data and initialization checked; train() was not called.")
         return
-    train(args, model, optimizer, train_tokens, val_tokens, start_iteration, logger)
+    wandb_run = setup_wandb(args, config)
+    try:
+        train(
+            args, model, optimizer, train_tokens, val_tokens, start_iteration, logger,
+            start_elapsed_seconds=start_elapsed_seconds, wandb_run=wandb_run,
+            checkpoint_callback=checkpoint_callback,
+        )
+    except BaseException:
+        if wandb_run is not None:
+            wandb_run.finish(exit_code=1)
+        raise
+    else:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
